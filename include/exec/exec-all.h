@@ -320,6 +320,8 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
 void tlb_set_page(CPUState *cpu, target_ulong vaddr,
                   hwaddr paddr, int prot,
                   int mmu_idx, target_ulong size);
+void tlb_flush_range_by_pa(CPUState *cpu, target_ulong paddr, target_ulong len);
+void tlb_flush_range_by_pa_all_cpus_synced(CPUState *cpu, target_ulong paddr, target_ulong len);
 #else
 static inline void tlb_init(CPUState *cpu)
 {

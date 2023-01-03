@@ -359,6 +359,10 @@ typedef enum ARMFaultType {
     ARMFault_ICacheMaint,
     ARMFault_QEMU_NSCExec, /* v8M: NS executing in S&NSC memory */
     ARMFault_QEMU_SFault, /* v8M: SecureFault INVTRAN, INVEP or AUVIOL */
+    ARMFault_GPF,
+    ARMFault_GPTWalk,
+    ARMFault_GPTAddressSize,
+    ARMFault_SyncExternalOnGPTFetch,
 } ARMFaultType;
 
 /**
@@ -367,6 +371,9 @@ typedef enum ARMFaultType {
  * @level: Table walk level (for translation, access flag and permission faults)
  * @domain: Domain of the fault address (for non-LPAE CPUs only)
  * @s2addr: Address that caused a fault at stage 2
+ * @maddr: faulting PA for Granule Protection Check exceptions taken to EL3
+ * @gpt0: True if GPC faulted at GPT level 0
+ * @nptw: True if GPC not on translation table walk.
  * @stage2: True if we faulted at stage 2
  * @s1ptw: True if we faulted at stage 2 while doing a stage 1 page-table walk
  * @s1ns: True if we faulted on a non-secure IPA while in secure state
@@ -376,12 +383,15 @@ typedef struct ARMMMUFaultInfo ARMMMUFaultInfo;
 struct ARMMMUFaultInfo {
     ARMFaultType type;
     target_ulong s2addr;
+    target_ulong maddr;
     int level;
     int domain;
     bool stage2;
     bool s1ptw;
     bool s1ns;
     bool ea;
+    bool gpt0;
+    bool nptw;
 };
 
 /**
@@ -466,6 +476,63 @@ static inline uint32_t arm_fi_to_sfsc(ARMMMUFaultInfo *fi)
     return fsc;
 }
 
+static inline int rme_fi_to_s2ptw(ARMMMUFaultInfo *fi)
+{
+    if (fi->nptw || !fi->stage2)
+        return 0;
+    else
+        return 1;
+}
+
+static inline int rme_fi_to_gpcsc(ARMMMUFaultInfo *fi)
+{
+    int gpcsc;
+
+    switch (fi->type) {
+    case ARMFault_GPF:
+        gpcsc = 0x0c;
+        break;
+    case ARMFault_GPTWalk:
+        gpcsc = 0x04;
+        break;
+    case ARMFault_GPTAddressSize:
+        gpcsc = 0x00;
+        break;
+    case ARMFault_SyncExternalOnGPTFetch:
+        gpcsc = 0x14;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (!fi->gpt0)
+        gpcsc |= 0x1;
+
+    return gpcsc;
+}
+
+static inline uint32_t rme_fi_to_lfsc(ARMMMUFaultInfo *fi)
+{
+    uint32_t fsc;
+
+    switch (fi->type) {
+    case ARMFault_GPF:
+    case ARMFault_GPTWalk:
+    case ARMFault_GPTAddressSize:
+    case ARMFault_SyncExternalOnGPTFetch:
+        if (fi->nptw)
+            fsc = 0x24;
+        else
+            fsc = (fi->level & 3) | (0x9 << 2);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    fsc |= 1 << 9;
+    return fsc;
+}
+
 /**
  * arm_fi_to_lfsc: Convert fault info struct to long-format FSC
  * Compare pseudocode EncodeLDFSC(), though unlike that function
@@ -523,6 +590,8 @@ static inline uint32_t arm_fi_to_lfsc(ARMMMUFaultInfo *fi)
     case ARMFault_Exclusive:
         fsc = 0x35;
         break;
+    case ARMFault_GPF:
+        return rme_fi_to_lfsc(fi);
     default:
         /* Other faults can't occur in a context that requires a
          * long-format status code.
@@ -554,6 +623,7 @@ void arm_cpu_record_sigbus(CPUState *cpu, vaddr addr,
 bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                       MMUAccessType access_type, int mmu_idx,
                       bool probe, uintptr_t retaddr);
+int arm_cpu_tlb_state(CPUState *cs, int mmu_idx);
 #endif
 
 static inline int arm_to_core_mmu_idx(ARMMMUIdx mmu_idx)
@@ -757,6 +827,23 @@ static inline uint32_t regime_el(CPUARMState *env, ARMMMUIdx mmu_idx)
     default:
         g_assert_not_reached();
     }
+}
+
+static inline bool rme_regime_is_root(CPUARMState *env, ARMMMUIdx mmu_idx)
+{
+    if (regime_el(env, mmu_idx) == 3) {
+        return true;
+    }
+    return false;
+}
+
+static inline bool rme_regime_is_realm(CPUARMState *env, ARMMMUIdx mmu_idx)
+{
+    if (!rme_regime_is_root(env, mmu_idx) &&
+        (env->cp15.scr_el3 & SCR_NSE)) {
+        return true;
+    }
+    return false;
 }
 
 /* Return the TCR controlling this translation regime */

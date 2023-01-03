@@ -55,6 +55,7 @@
 #define EXCP_LSERR          21   /* v8M LSERR SecureFault */
 #define EXCP_UNALIGNED      22   /* v7M UNALIGNED UsageFault */
 #define EXCP_DIVBYZERO      23   /* v7M DIVBYZERO UsageFault */
+#define EXCP_GPC            24   /* v9 Granule Protection Check Exception */
 /* NB: add new EXCP_ defines to the array in arm_log_exception() too */
 
 #define ARMV7M_EXCP_RESET   1
@@ -578,6 +579,7 @@ typedef struct CPUARMState {
         uint32_t syndrome; /* AArch64 format syndrome register */
         uint32_t fsr; /* AArch32 format fault status register info */
         uint64_t vaddress; /* virtual addr associated with exception, if any */
+        uint64_t maddress; /* faulting PA for Granule Protection Check exceptions */
         uint32_t target_el; /* EL the exception should be targeted for */
         /* If we implement EL2 we will also need to store information
          * about the intermediate physical address for stage 2 faults.
@@ -733,6 +735,10 @@ typedef struct CPUARMState {
     /* Linux syscall tagged address support */
     bool tagged_addr_enable;
 #endif
+
+    uint64_t gpccr_el3;
+    uint64_t gptbr_el3;
+    uint64_t mfar_el3;
 } CPUARMState;
 
 static inline void set_feature(CPUARMState *env, int feature)
@@ -1539,6 +1545,9 @@ static inline void xpsr_write(CPUARMState *env, uint32_t val, uint32_t mask)
 #define SCR_FIEN              (1U << 21)
 #define SCR_ENSCXT            (1U << 25)
 #define SCR_ATA               (1U << 26)
+#define SCR_TRNDR             (1ULL << 40)
+#define SCR_GPF               (1ULL << 48)
+#define SCR_NSE               (1ULL << 62)
 
 #define HSTR_TTEE (1 << 16)
 #define HSTR_TJDBX (1 << 17)
@@ -1994,6 +2003,7 @@ FIELD(ID_AA64PFR0, SEL2, 36, 4)
 FIELD(ID_AA64PFR0, MPAM, 40, 4)
 FIELD(ID_AA64PFR0, AMU, 44, 4)
 FIELD(ID_AA64PFR0, DIT, 48, 4)
+FIELD(ID_AA64PFR0, RME, 52, 4)
 FIELD(ID_AA64PFR0, CSV2, 56, 4)
 FIELD(ID_AA64PFR0, CSV3, 60, 4)
 
@@ -4211,6 +4221,11 @@ static inline bool isar_feature_aa64_sel2(const ARMISARegisters *id)
     return FIELD_EX64(id->id_aa64pfr0, ID_AA64PFR0, SEL2) != 0;
 }
 
+static inline bool isar_feature_aa64_rme(const ARMISARegisters *id)
+{
+    return FIELD_EX64(id->id_aa64pfr0, ID_AA64PFR0, RME) != 0;
+}
+
 static inline bool isar_feature_aa64_vh(const ARMISARegisters *id)
 {
     return FIELD_EX64(id->id_aa64mmfr1, ID_AA64MMFR1, VH) != 0;
@@ -4386,10 +4401,38 @@ static inline bool isar_feature_any_tts2uxn(const ARMISARegisters *id)
     return isar_feature_aa64_tts2uxn(id) || isar_feature_aa32_tts2uxn(id);
 }
 
+typedef enum ARMSecurityState {
+    ARMSecurityState_Secure     = 0,
+    ARMSecurityState_NonSecure  = 1,
+    ARMSecurityState_Root       = 2,
+    ARMSecurityState_Realm      = 3,
+} ARMSecurityState;
+
+#define GPT_ENTRY_BITS              (3)
+#define GPT_DESC_TYPE_L0_BLOCK      (0x1)
+#define GPT_DESC_TYPE_L0_TABLE      (0x3)
+#define GPT_DESC_TYPE_L1_CONTIGUOUS (0x1)
+#define GPT_DESC_TYPE_OFFSET        (0)
+#define GPT_DESC_TYPE_LENGTH        (4)
+
+static inline bool arm_is_gpc_enabled(CPUARMState *env)
+{
+    return extract64(env->gpccr_el3, 16, 1);
+}
+
 /*
  * Forward to the above feature tests given an ARMCPU pointer.
  */
 #define cpu_isar_feature(name, cpu) \
     ({ ARMCPU *cpu_ = (cpu); isar_feature_##name(&cpu_->isar); })
+
+static inline bool arm_is_realm_below_el3(CPUARMState *env)
+{
+    if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+        return env->cp15.scr_el3 & SCR_NSE;
+    } else {
+        return false;
+    }
+}
 
 #endif

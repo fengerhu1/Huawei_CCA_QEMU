@@ -11,6 +11,39 @@
 #include "exec/exec-all.h"
 #include "exec/helper-proto.h"
 
+static inline bool rme_is_gpc_exception(CPUARMState *env, ARMMMUFaultInfo *fi)
+{
+    if (fi->type == ARMFault_GPTWalk ||
+        fi->type == ARMFault_GPTAddressSize ||
+        fi->type == ARMFault_SyncExternalOnGPTFetch) {
+        /* GPT address size fault, GPT walk fault, Synchronous External abort
+         * on GPT fetch are always reported as GPC exceptions.
+         */
+        return true;
+    } else if (fi->type == ARMFault_GPF) {
+        if (arm_current_el(env) == 3) {
+            /* A GPF at EL3 is reported synchronously as an Instruction Abort
+             * or Data Abort exception
+             */
+            return false;
+        }
+        if (env->cp15.scr_el3 & SCR_GPF) {
+            /* If SCR_EL3.GPF == 1, a GPF at EL0,1,2 is reported synchronously
+             * as a GPC exception
+             */
+            return true;
+        } else {
+            /* If SCR_EL3.GPF == 0, a GPF at EL0,1,2 is reported synchronously
+             * as an Instruction Abort or Data Abort exception
+             */
+            return false;
+        }
+    }
+
+    return false;
+}
+
+
 static inline uint32_t merge_syn_data_abort(uint32_t template_syn,
                                             unsigned int target_el,
                                             bool same_el, bool ea,
@@ -96,6 +129,22 @@ static void QEMU_NORETURN arm_deliver_fault(ARMCPU *cpu, vaddr addr,
             env->cp15.hpfar_el2 |= HPFAR_NS;
         }
     }
+    if (cpu_isar_feature(aa64_rme, cpu) &&
+        rme_is_gpc_exception(env, fi)) {
+        target_el = 3;
+        fsr = rme_fi_to_lfsc(fi);
+        fsc = extract32(fsr, 0, 6);
+        syn = syn_gpc_exception(rme_fi_to_s2ptw(fi),
+                                access_type == MMU_INST_FETCH,
+                                rme_fi_to_gpcsc(fi),
+                                0, fi->s1ptw,
+                                access_type == MMU_DATA_STORE,
+                                fsc);
+
+        exc = EXCP_GPC;
+        env->exception.maddress = fi->maddr;
+        goto do_raise_exception;
+    }
     same_el = (arm_current_el(env) == target_el);
 
     fsr = compute_fsr_fsc(env, fi, target_el, mmu_idx, &fsc);
@@ -115,6 +164,7 @@ static void QEMU_NORETURN arm_deliver_fault(ARMCPU *cpu, vaddr addr,
         exc = EXCP_DATA_ABORT;
     }
 
+do_raise_exception:
     env->exception.vaddress = addr;
     env->exception.fsr = fsr;
     raise_exception(env, exc, syn, target_el);
@@ -223,6 +273,17 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         cpu_restore_state(cs, retaddr, true);
         arm_deliver_fault(cpu, address, access_type, mmu_idx, &fi);
     }
+}
+int arm_cpu_tlb_state(CPUState *cs, int mmu_idx)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+
+    if (cpu_isar_feature(aa64_rme, cpu) &&
+        rme_regime_is_realm(env, core_to_arm_mmu_idx(env, mmu_idx))) {
+        return TLB_STATE_NSE;
+    }
+    return 0;
 }
 #else
 void arm_cpu_record_sigsegv(CPUState *cs, vaddr addr,

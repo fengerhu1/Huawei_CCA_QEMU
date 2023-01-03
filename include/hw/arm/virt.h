@@ -60,6 +60,7 @@
 enum {
     VIRT_FLASH,
     VIRT_MEM,
+    VIRT_RMM_MEM,
     VIRT_CPUPERIPHS,
     VIRT_GIC_DIST,
     VIRT_GIC_CPU,

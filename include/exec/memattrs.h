@@ -33,6 +33,8 @@ typedef struct MemTxAttrs {
      * x86: System Management Mode access
      */
     unsigned int secure:1;
+    /* FEAT_RME Realm & Root NSE bit extension */
+    unsigned int secure_e:1;
     /* Memory access is usermode (unprivileged) */
     unsigned int user:1;
     /* Requester ID (for MSI for example) */

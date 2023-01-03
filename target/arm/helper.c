@@ -1753,7 +1753,7 @@ static void vbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void scr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
 {
     /* Begin with base v8.0 state.  */
-    uint32_t valid_mask = 0x3fff;
+    uint64_t valid_mask = 0x3fff;
     ARMCPU *cpu = env_archcpu(env);
 
     if (ri->state == ARM_CP_STATE_AA64) {
@@ -1771,6 +1771,9 @@ static void scr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
         }
         if (cpu_isar_feature(aa64_sel2, cpu)) {
             valid_mask |= SCR_EEL2;
+        }
+        if (cpu_isar_feature(aa64_rme, cpu)) {
+            valid_mask |= SCR_NSE | SCR_GPF | SCR_TRNDR;
         }
         if (cpu_isar_feature(aa64_mte, cpu)) {
             valid_mask |= SCR_ATA;
@@ -4261,6 +4264,23 @@ static CPAccessResult aa64_cacheop_pou_access(CPUARMState *env,
     return CP_ACCESS_OK;
 }
 
+// Implementation for cache popa
+static CPAccessResult aa64_cacheop_popa_access(CPUARMState *env,
+                                              const ARMCPRegInfo *ri,
+                                              bool isread)
+{
+    int el = arm_current_el(env);
+    if (el == 0) {
+        return CP_ACCESS_TRAP;
+    } else if (el == 1) {
+        return CP_ACCESS_TRAP_EL2;
+    } else if (el == 2) {
+        return CP_ACCESS_TRAP_EL3;
+    } else {
+        return CP_ACCESS_OK;
+    }
+}
+
 /* See: D4.7.2 TLB maintenance requirements and the TLB maintenance instructions
  * Page D4-1736 (DDI0487A.b)
  */
@@ -4672,6 +4692,122 @@ static void tlbi_aa64_rvae3is_write(CPUARMState *env,
 
     do_rvae_write(env, value, ARMMMUIdxBit_SE3, true);
 }
+
+static void tlbi_aa64_paall_write(CPUARMState *env,
+                                    const ARMCPRegInfo *ri,
+                                    uint64_t value)
+{
+    tlb_flush(env_cpu(env));
+}
+
+static void tlbi_aa64_paallis_write(CPUARMState *env,
+                                    const ARMCPRegInfo *ri,
+                                    uint64_t value)
+{
+    tlb_flush_all_cpus_synced(env_cpu(env));
+}
+
+static inline uint64_t tlbi_aa64_rpa_base_addr(CPUARMState *env, uint64_t value)
+{
+    uint64_t pgs, pbaddr;
+    pgs = extract64(env->gpccr_el3, 14, 2);
+    pbaddr = extract64(value, 0, 40);
+
+    switch (pgs) {
+        case 0b00:
+            return pbaddr << 12;
+        case 0b01:
+            return (pbaddr & (~15ULL)) << 12;
+        case 0b10:
+            return (pbaddr & (~3ULL)) << 12;
+        default:
+            return 0;
+    }
+}
+
+static inline uint64_t tlbi_aa64_rpa_size(uint64_t value)
+{
+    uint64_t size;
+    size = extract64(value, 44, 4);
+    switch (size) {
+        case 0b0000:
+            return 1ULL << 12;
+        case 0b0001:
+            return 1ULL << 14;
+        case 0b0010:
+            return 1ULL << 16;
+        case 0b0011:
+            return 1ULL << 21;
+        case 0b0100:
+            return 1ULL << 25;
+        case 0b0101:
+            return 1ULL << 29;
+        case 0b0110:
+            return 1ULL << 30;
+        case 0b0111:
+            return 1ULL << 34;
+        case 0b1000:
+            return 1ULL << 36;
+        case 0b1001:
+            return 1ULL << 39;
+        default:
+        return 0;
+    }
+}
+
+static inline uint64_t tlbi_aa64_rpa_pg_size(CPUARMState *env)
+{
+    uint64_t pgs;
+    pgs = extract64(env->gpccr_el3, 14, 2);
+    switch (pgs) {
+        case 0b00:
+            return 1ULL << 12;
+        case 0b01:
+            return 1ULL << 16;
+        case 0b10:
+            return 1ULL << 14;
+        default:
+            return 0;
+    }
+}
+
+static void do_rpais_write(CPUARMState *env, uint64_t value, bool synced)
+{
+    uint64_t pbaddr, length, pgs;
+
+    pbaddr = tlbi_aa64_rpa_base_addr(env, value);
+    length = tlbi_aa64_rpa_size(value);
+    pgs = tlbi_aa64_rpa_pg_size(env);
+
+    if ( !pbaddr || !length || !pgs) {
+        return;
+    }
+    if (pgs > length)   length = pgs;
+
+    if (pbaddr & (length - 1)) {
+        return;
+    }
+
+    if (synced) {
+        tlb_flush_range_by_pa_all_cpus_synced(env_cpu(env), pbaddr, length);
+    } else {
+        tlb_flush_range_by_pa(env_cpu(env), pbaddr, length);
+    }
+}
+
+static void tlbi_aa64_rpalis_write(CPUARMState *env,
+                                    const ARMCPRegInfo *ri,
+                                    uint64_t value)
+{
+    do_rpais_write(env, value, false);
+}
+static void tlbi_aa64_rpais_write(CPUARMState *env,
+                                    const ARMCPRegInfo *ri,
+                                    uint64_t value)
+{
+    do_rpais_write(env, value, true);
+}
+
 #endif
 
 static CPAccessResult aa64_zva_access(CPUARMState *env, const ARMCPRegInfo *ri,
@@ -5741,6 +5877,20 @@ static CPAccessResult nsacr_access(CPUARMState *env, const ARMCPRegInfo *ri,
         return CP_ACCESS_OK;
     }
     return CP_ACCESS_TRAP_UNCATEGORIZED;
+}
+
+static void gpccr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
+{
+    qemu_log_mask(CPU_LOG_RME, "gpccr_write: %s <--- %" PRIu64 "\n", ri->name, value);
+
+    raw_write(env, ri, value);
+}
+
+static void gptbr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
+{
+    qemu_log_mask(CPU_LOG_RME, "gptbr_write: %s <--- %" PRIu64 "\n", ri->name, value);
+
+    raw_write(env, ri, value);
 }
 
 static const ARMCPRegInfo el3_cp_reginfo[] = {
@@ -7981,6 +8131,43 @@ void register_cp_regs_for_features(ARMCPU *cpu)
         };
 
         define_arm_cp_regs(cpu, el3_regs);
+        if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+            ARMCPRegInfo el3_rme_regs[] = {
+                { .name = "GPCCR_EL3", .state = ARM_CP_STATE_AA64,
+                .opc0 = 3, .opc1 = 6, .crn = 2, .crm = 1, .opc2 = 6,
+                .access = PL3_RW, .fieldoffset = offsetof(CPUARMState, gpccr_el3),
+                .resetvalue = 0, .writefn = gpccr_write },
+                { .name = "GPTBR_EL3", .state = ARM_CP_STATE_AA64,
+                .opc0 = 3, .opc1 = 6, .crn = 2, .crm = 1, .opc2 = 4,
+                .access = PL3_RW, .fieldoffset = offsetof(CPUARMState, gptbr_el3),
+                .resetvalue = 0, .writefn = gptbr_write },
+                { .name = "MFAR_EL3", .state = ARM_CP_STATE_AA64,
+                .opc0 = 3, .opc1 = 6, .crn = 6, .crm = 0, .opc2 = 5,
+                .access = PL3_RW, .fieldoffset = offsetof(CPUARMState, mfar_el3) },
+                { .name = "TLBI_PAALL", .state = ARM_CP_STATE_AA64,
+                .opc0 = 1, .opc1 = 6, .crn = 8, .crm = 7, .opc2 = 4,
+                .access = PL3_W, .type = ARM_CP_NO_RAW,
+                .writefn = tlbi_aa64_paall_write },
+                { .name = "TLBI_PAALLOS", .state = ARM_CP_STATE_AA64,
+                .opc0 = 1, .opc1 = 6, .crn = 8, .crm = 1, .opc2 = 4,
+                .access = PL3_W, .type = ARM_CP_NO_RAW,
+                .writefn = tlbi_aa64_paallis_write },
+                { .name = "TLBI_RPALOS", .state = ARM_CP_STATE_AA64,
+                .opc0 = 1, .opc1 = 6, .crn = 8, .crm = 4, .opc2 = 7,
+                .access = PL3_W, .type = ARM_CP_NO_RAW,
+                .writefn = tlbi_aa64_rpalis_write },
+                { .name = "TLBI_RPAOS", .state = ARM_CP_STATE_AA64,
+                .opc0 = 1, .opc1 = 6, .crn = 8, .crm = 4, .opc2 = 3,
+                .access = PL3_W, .type = ARM_CP_NO_RAW,
+                .writefn = tlbi_aa64_rpais_write },
+                { .name = "DC_CIPAPA", .state = ARM_CP_STATE_AA64,
+                .opc0 = 1, .opc1 = 6, .crn = 7, .crm = 14, .opc2 = 1,
+                .access = PL3_W, .type = ARM_CP_NOP,
+                .accessfn = aa64_cacheop_popa_access },
+                REGINFO_SENTINEL
+            };
+            define_arm_cp_regs(cpu, el3_rme_regs);
+        }
     }
     /* The behaviour of NSACR is sufficiently various that we don't
      * try to describe it in a single reginfo:
@@ -9312,6 +9499,7 @@ void arm_log_exception(int idx)
             [EXCP_LSERR] = "v8M LSERR UsageFault",
             [EXCP_UNALIGNED] = "v7M UNALIGNED UsageFault",
             [EXCP_DIVBYZERO] = "v7M DIVBYZERO UsageFault",
+            [EXCP_GPC]       = "v9 Granule Protection Check Exception",
         };
 
         if (idx >= 0 && idx < ARRAY_SIZE(excnames)) {
@@ -9983,8 +10171,11 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
     }
 
     switch (cs->exception_index) {
+    case EXCP_GPC:
     case EXCP_PREFETCH_ABORT:
     case EXCP_DATA_ABORT:
+        if (cs->exception_index == EXCP_GPC)
+            env->mfar_el3 = env->exception.maddress;
         env->cp15.far_el[new_el] = env->exception.vaddress;
         qemu_log_mask(CPU_LOG_INT, "...with FAR 0x%" PRIx64 "\n",
                       env->cp15.far_el[new_el]);
@@ -10343,6 +10534,352 @@ bool arm_s1_regime_using_lpae_format(CPUARMState *env, ARMMMUIdx mmu_idx)
 }
 
 #ifndef CONFIG_USER_ONLY
+static inline ARMSecurityState rme_attrs_to_security_state(MemTxAttrs *attrs)
+{
+    if (attrs->secure_e) {
+        return attrs->secure ? ARMSecurityState_Root
+                            : ARMSecurityState_Realm;
+    } else {
+        return attrs->secure ? ARMSecurityState_Secure
+                            : ARMSecurityState_NonSecure;
+    }
+}
+static inline void rme_security_state_to_attrs(MemTxAttrs *attrs, ARMSecurityState state)
+{
+    attrs->secure_e = false;
+    attrs->secure = false;
+    if ((state == ARMSecurityState_Root) ||
+        (state == ARMSecurityState_Realm)) {
+        attrs->secure_e = true;
+    }
+    if ((state == ARMSecurityState_Root) ||
+        (state == ARMSecurityState_Secure)) {
+        attrs->secure = true;
+    }
+}
+
+static bool arm_gpc_parameters(CPUARMState *env,
+                               int *s, int *t, int *p)
+{
+    int l0gptsz, pps, pgs;
+
+    pps = extract64(env->gpccr_el3, 0, 3);
+    switch (pps) {
+        /* 4GB、64GB、1TB */
+        case 0b000 ... 0b010:
+            *t = 32 + 4 * pps;
+            break;
+        /* 4TB */
+        case 0b011:
+            *t = 42;
+            break;
+        /* 16TB、256TB、4PB */
+        case 0b100 ... 0b110:
+            *t = 28 + 4 * pps;
+            break;
+        default:
+            return false;
+    }
+
+    l0gptsz = extract64(env->gpccr_el3, 20, 4);
+    switch (l0gptsz) {
+        case 0b0000:
+            /* Each entry covers 1GB */
+            *s = 30;
+            break;
+        case 0b0100:
+            /* 16GB */
+            *s = 34;
+            break;
+        case 0b0110:
+            /* 64GB */
+            *s = 36;
+            break;
+        case 0b1001:
+            /* 512GB */
+            *s = 39;
+            break;
+        default:
+            return false;
+    }
+
+    if (*s > *t)    return false;
+
+    pgs = extract64(env->gpccr_el3, 14, 2);
+    switch (pgs) {
+        case 0b00:
+            /* Physical Granule size is 4KB */
+            *p = 12;
+            break;
+        case 0b01:
+            /* 64KB */
+            *p = 16;
+            break;
+        case 0b10:
+            /* 16KB */
+            *p = 14;
+            break;
+        default:
+            return false;
+    }
+
+    return true;
+}
+
+static bool arm_get_gpt_base_addr(CPUARMState *env,
+                                  int s, int t,
+                                  uint64_t *gpt_baddr)
+{
+    /*
+    * x = Max(pps - l0gptsz + 2, 11)
+    * if x is greater than 11, then BADDR[x - 12:0] are RES0
+    */
+    if ((t - s + 2 > 11) &&
+        extract64(env->gptbr_el3, 0, t - s - 9)) {
+        return false;
+    }
+
+    *gpt_baddr = (extract64(env->gptbr_el3, 0, 40) << 12);
+    return true;
+}
+
+static bool check_gpi_value(int gpi_value, ARMSecurityState security_state,
+                            ARMFaultType *fault_type)
+{
+    *fault_type = ARMFault_GPF;
+
+    if (gpi_value == 0b0000) {
+        /* No accesses permitted */
+        return true;
+    } else if (gpi_value == 0b1000) {
+        /* Accesses permitted to Secure physical address space only */
+        if (security_state == ARMSecurityState_Secure) {
+            return false;
+        } else {
+            return true;
+        }
+    } else if (gpi_value == 0b1001) {
+        /* Accesses permitted to Non-secure physical address space only */
+        if (security_state == ARMSecurityState_NonSecure) {
+            return false;
+        } else {
+            return true;
+        }
+    } else if (gpi_value == 0b1010) {
+        /* Accesses permitted to Root physical address space only */
+        if (security_state == ARMSecurityState_Root) {
+            return false;
+        } else {
+            return true;
+        }
+    } else if (gpi_value == 0b1011) {
+        /* Accesses permitted to Realm physical address space only */
+        if (security_state == ARMSecurityState_Realm) {
+            return false;
+        } else {
+            return true;
+        }
+    } else if (gpi_value == 0b1111) {
+        /* All accesses permitted */
+        return false;
+    } else {
+        /* Reserved */
+        *fault_type = ARMFault_GPTWalk;
+        return true;
+    }
+
+    return true;
+}
+
+static bool rme_check_granule_protection(CPUARMState *env, hwaddr phys_addr,
+                                         MemTxAttrs *attrs,
+                                         target_ulong *page_size_ptr,
+                                         ARMMMUFaultInfo *fi)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
+    uint64_t gpt_baddr;
+    ARMFaultType fault_type = ARMFault_GPTWalk;
+    int level = 0;
+    int s, t, p;
+    AddressSpace *as;
+    MemTxAttrs gpt_attrs = {};
+    MemTxResult result = MEMTX_OK;
+    uint64_t idx, entry_addr, gpt_entry;
+    int desc_type, gpi_value, contig;
+    uint64_t pro_phy_addrsize;
+    ARMSecurityState security_state;
+
+    if (!arm_is_gpc_enabled(env)) {
+        return false;
+    }
+
+    if (!arm_gpc_parameters(env, &s, &t, &p)) {
+        goto do_fault;
+    }
+
+    if (!arm_get_gpt_base_addr(env, s, t, &gpt_baddr)) {
+        goto do_fault;
+    }
+
+    pro_phy_addrsize = (1ull << t);
+    if (gpt_baddr >= pro_phy_addrsize) {
+        fault_type = ARMFault_GPTAddressSize;
+        goto do_fault;
+    }
+
+    security_state = rme_attrs_to_security_state(attrs);
+
+    if (phys_addr >= pro_phy_addrsize) {
+        if (security_state == ARMSecurityState_NonSecure) {
+            return false;
+        }
+
+        fault_type = ARMFault_GPF;
+        goto do_fault;
+    }
+
+    gpt_attrs.secure = true;
+    as = arm_addressspace(cs, gpt_attrs);
+
+    /* PA[t-1:s] index into level0 table */
+    idx = extract64(phys_addr, s, t - s);
+    entry_addr = gpt_baddr + (idx << GPT_ENTRY_BITS);
+
+    /* all structures in the GPT are little-endian */
+    gpt_entry = address_space_ldq_le(as, entry_addr, gpt_attrs, &result);
+    if (result != MEMTX_OK) {
+        fault_type = ARMFault_SyncExternalOnGPTFetch;
+        goto do_fault;
+    }
+
+    desc_type = extract64(gpt_entry, GPT_DESC_TYPE_OFFSET, GPT_DESC_TYPE_LENGTH);
+
+    if (desc_type == GPT_DESC_TYPE_L0_BLOCK) {
+        /* handle l0 Block descriptor entry */
+        if (page_size_ptr) {
+            *page_size_ptr = (1ull << s);
+        }
+
+        gpi_value = extract64(gpt_entry, 4, 4);
+        if (extract64(gpt_entry, 8, 56)) {
+            fault_type = ARMFault_GPTWalk;
+            goto do_fault;
+        }
+
+        if (!check_gpi_value(gpi_value, security_state, &fault_type)) {
+            return false;
+        } else {
+            qemu_log_mask(CPU_LOG_RME, "check_gpi_value failed, scr_el3: 0x%"
+                    PRIx64 ", phys_addr: 0x%" PRIx64 ", security_state: %d\n",
+                    env->cp15.scr_el3, phys_addr, security_state);
+            goto do_fault;
+        }
+
+    } else if (desc_type == GPT_DESC_TYPE_L0_TABLE) {
+        /* handle l0 table descriptor entry */
+        if (extract64(gpt_entry, 4, 8) ||
+            extract64(gpt_entry, 52, 12) ||
+            extract64(gpt_entry, 12, s - p - 13))
+        {
+            /*
+            * [11:4] RES0
+            * [63:52] RES0
+            * [s-p-2:12] RES0
+            */
+            fault_type = ARMFault_GPTWalk;
+            goto do_fault;
+        }
+
+        entry_addr = extract64(gpt_entry, 12, 40) << 12;
+
+        /* PA[s-1:p+4] index into level1 table */
+        idx = extract64(phys_addr, p + 4, s - p - 4);
+        entry_addr += (idx << GPT_ENTRY_BITS);
+
+        level = 1;
+
+        gpt_entry = address_space_ldq_le(as, entry_addr, gpt_attrs, &result);
+        if (result != MEMTX_OK) {
+            fault_type = ARMFault_SyncExternalOnGPTFetch;
+            goto do_fault;
+        }
+
+        desc_type = extract64(gpt_entry, 0, 4);
+        if (desc_type == GPT_DESC_TYPE_L1_CONTIGUOUS) {
+            /* handle l1 contiguous descriptor */
+            if (extract64(gpt_entry, 10, 54)) {
+                /*
+                * [63:10] RES0
+                */
+                fault_type = ARMFault_GPTWalk;
+                goto do_fault;
+            }
+
+            contig = extract64(gpt_entry, 8, 2);
+            switch (contig) {
+                case 0b00:
+                    fault_type = ARMFault_GPTWalk;
+                    goto do_fault;
+                case 0b01:
+                    if (page_size_ptr) {
+                        *page_size_ptr = (1ull << 21);
+                    }
+                    break;
+                case 0b10:
+                    if (page_size_ptr) {
+                        *page_size_ptr = (1ull << 25);
+                    }
+                    break;
+                case 0b11:
+                    if (page_size_ptr) {
+                        *page_size_ptr = (1ull << 29);
+                    }
+                    break;
+            }
+
+            gpi_value = extract64(gpt_entry, 4, 4);
+
+            if (!check_gpi_value(gpi_value, security_state, &fault_type)) {
+                return false;
+            } else {
+                qemu_log_mask(CPU_LOG_RME, "check_gpi_value failed, scr_el3: 0x%"
+                        PRIx64 ", phys_addr: 0x%" PRIx64 ", security_state: %d\n",
+                        env->cp15.scr_el3, phys_addr, security_state);
+                goto do_fault;
+            }
+
+        } else {
+            /* l1 GPI */
+            if (page_size_ptr) {
+                *page_size_ptr = (1ull << p);
+            }
+            idx = extract64(phys_addr, p, 4);
+            gpi_value = extract64(gpt_entry, 4 * idx, 4);
+
+            if (!check_gpi_value(gpi_value, security_state, &fault_type)) {
+                return false;
+            } else {
+                qemu_log_mask(CPU_LOG_RME, "check_gpi_value failed, scr_el3: 0x%"
+                        PRIx64 ", phys_addr: 0x%" PRIx64 ", security_state: %d\n",
+                        env->cp15.scr_el3, phys_addr, security_state);
+                goto do_fault;
+            }
+        }
+
+    } else {
+        /* invalid l0 entry */
+        fault_type = ARMFault_GPTWalk;
+        goto do_fault;
+    }
+
+    return false;
+do_fault:
+    fi->type = fault_type;
+    fi->level = level;
+    return true;
+}
+
 static inline bool regime_is_user(CPUARMState *env, ARMMMUIdx mmu_idx)
 {
     switch (mmu_idx) {
@@ -10627,6 +11164,22 @@ static hwaddr S1_ptw_translate(CPUARMState *env, ARMMMUIdx mmu_idx,
             fi->s1ns = !*is_secure;
             return ~0;
         }
+
+        if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+            if (rme_regime_is_realm(env, mmu_idx) &&
+                (rme_attrs_to_security_state(&txattrs) != ARMSecurityState_Realm)) {
+                /* DDI0615A - R(QMLYQ):If the stage2 translation for a Realm stage1 translation
+                *  table walk resolves to an address not in the Realm physical address space, it
+                *  causes a stage2 Permission fault.
+                */
+                fi->type = ARMFault_Permission;
+                fi->s2addr = addr;
+                fi->stage2 = true;
+                fi->s1ptw = true;
+                return ~0;
+            }
+        }
+
         if ((arm_hcr_el2_eff(env) & HCR_PTW) &&
             (cacheattrs.attrs & 0xf0) == 0) {
             /*
@@ -10703,6 +11256,19 @@ static uint64_t arm_ldq_ptw(CPUState *cs, hwaddr addr, bool is_secure,
     if (fi->s1ptw) {
         return 0;
     }
+
+    if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+        if (rme_regime_is_root(env, mmu_idx)) {
+            /* for root stage1 translation, all levels of lookup are made to root pas */
+            rme_security_state_to_attrs(&attrs, ARMSecurityState_Root);
+        } else if (rme_regime_is_realm(env, mmu_idx)) {
+            rme_security_state_to_attrs(&attrs, ARMSecurityState_Realm);
+        }
+        if (rme_check_granule_protection(env, addr, &attrs, NULL, fi)) {
+            return 0;
+        }
+    }
+
     if (regime_translation_big_endian(env, mmu_idx)) {
         data = address_space_ldq_be(as, addr, attrs, &result);
     } else {
@@ -11302,6 +11868,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, uint64_t address,
     int addrsize, inputsize;
     TCR *tcr = regime_tcr(env, mmu_idx);
     int ap, ns, xn, pxn;
+    int nse = 0;
     uint32_t el = regime_el(env, mmu_idx);
     uint64_t descaddrmask;
     bool aarch64 = arm_el_is_aa64(env, el);
@@ -11476,12 +12043,32 @@ static bool get_phys_addr_lpae(CPUARMState *env, uint64_t address,
         attrs = extract64(descriptor, 2, 10)
             | (extract64(descriptor, 52, 12) << 10);
 
+        if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+            if (rme_regime_is_realm(env, mmu_idx)) {
+                if (mmu_idx == ARMMMUIdx_Stage2) {
+                    /* for block or page descriptor fetched for realm EL1&0 stage2, bit 55 is NS field */
+                    nse = !extract64(descriptor, 55, 1);
+                } else {
+                    /* for EL2 stage1 or EL2&0 stage1, bit 5 is NS field */
+                    nse = !extract64(descriptor, 5, 1);
+                }
+            } else if (rme_regime_is_root(env, mmu_idx)) {
+                /* for block or page descriptor fetched using El3 stage1 regime, bit 11 is NSE field */
+                nse = extract64(descriptor, 11, 1);
+            }
+        }
+
         if (mmu_idx == ARMMMUIdx_Stage2 || mmu_idx == ARMMMUIdx_Stage2_S) {
             /* Stage 2 table descriptors do not include any attribute fields */
             break;
         }
         /* Merge in attributes from table descriptors */
-        attrs |= nstable << 3; /* NS */
+        if (!cpu_isar_feature(aa64_rme, env_archcpu(env)) ||
+            !rme_regime_is_root(env, mmu_idx)) {
+            /* NSTable is removed for EL3 stage1 translation regime */
+            attrs |= nstable << 3; /* NS */
+        }
+
         guarded = extract64(descriptor, 50, 1);  /* GP */
         if (param.hpd) {
             /* HPD disables all the table attributes except NSTable.  */
@@ -11529,6 +12116,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, uint64_t address,
          */
         txattrs->secure = false;
     }
+    if (nse) {
+        txattrs->secure_e = true;
+    }
+
     /* When in aarch64 mode, and BTI is enabled, remember GP in the IOTLB.  */
     if (aarch64 && guarded && cpu_isar_feature(aa64_bti, cpu)) {
         arm_tlb_bti_gp(txattrs) = true;
@@ -12375,6 +12966,7 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
                    ARMMMUFaultInfo *fi, ARMCacheAttrs *cacheattrs)
 {
     ARMMMUIdx s1_mmu_idx = stage_1_mmu_idx(mmu_idx);
+    bool ret;
 
     if (mmu_idx != s1_mmu_idx) {
         /* Call ourselves recursively to do the stage 1 and then stage 2
@@ -12383,7 +12975,6 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
         if (arm_feature(env, ARM_FEATURE_EL2)) {
             hwaddr ipa;
             int s2_prot;
-            int ret;
             ARMCacheAttrs cacheattrs2 = {};
             ARMMMUIdx s2_mmu_idx;
             bool is_el0;
@@ -12394,6 +12985,21 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
             /* If S1 fails or S2 is disabled, return early.  */
             if (ret || regime_translation_disabled(env, ARMMMUIdx_Stage2)) {
                 *phys_ptr = ipa;
+
+                if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+                    if (ret){
+                        return ret;
+                    }
+                    /* EL1&0 regime(S2 disabled) translation done, check granule protection. */
+                    if (rme_regime_is_realm(env, mmu_idx)) {
+                        /* If realm EL1&0 stage2 translation is disabled, accesses to
+                        *  the realm IPA are made to the realm PA space.
+                        */
+                        rme_security_state_to_attrs(attrs, ARMSecurityState_Realm);
+                    }
+                    return rme_check_granule_protection(env, *phys_ptr, attrs, page_size, fi);
+                }
+
                 return ret;
             }
 
@@ -12440,6 +13046,25 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
                         || (env->cp15.vstcr_el2.raw_tcr & VSTCR_SA));
                 }
             }
+
+            if (cpu_isar_feature(aa64_rme, env_archcpu(env))) {
+                /* EL1&0 two-stage regime translation done, check granule protection. */
+                if ((access_type == MMU_INST_FETCH) &&
+                    rme_regime_is_realm(env, mmu_idx) &&
+                    (rme_attrs_to_security_state(attrs) != ARMSecurityState_Realm)) {
+                    /* If execution is using the realm EL1&0 translation regime, any attempt
+                    *  to execute an instruction fetched from physical memory other than the
+                    *  realm pas cause a stage2 Permission fault.
+                    */
+                    fi->type = ARMFault_Permission;
+                    fi->level = 0;
+                    fi->stage2 = true;
+                    return true;
+                }
+
+                return rme_check_granule_protection(env, *phys_ptr, attrs, page_size, fi);
+            }
+
             return 0;
         } else {
             /*
@@ -12469,7 +13094,6 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
     }
 
     if (arm_feature(env, ARM_FEATURE_PMSA)) {
-        bool ret;
         *page_size = TARGET_PAGE_SIZE;
 
         if (arm_feature(env, ARM_FEATURE_V8)) {
@@ -12562,13 +13186,63 @@ bool get_phys_addr(CPUARMState *env, target_ulong address,
             memattr = 0x00;      /* Device, nGnRnE */
         }
         cacheattrs->attrs = memattr;
+
+        if (cpu_isar_feature(aa64_rme, env_archcpu(env)) &&
+            !arm_mmu_idx_is_stage1_of_2(mmu_idx)) {
+            /* translation disabled granule protection check */
+            if (rme_regime_is_root(env, mmu_idx)) {
+                /* If translation is disabled for root, all output addresses from
+                *  execution at EL3 are root pas.
+                */
+                rme_security_state_to_attrs(attrs, ARMSecurityState_Root);
+            } else if (rme_regime_is_realm(env, mmu_idx)) {
+                /* If translation is disabled for realm, all output addresses from
+                *  execution at realm are realm pas.
+                */
+                rme_security_state_to_attrs(attrs, ARMSecurityState_Realm);
+            }
+
+            return rme_check_granule_protection(env, *phys_ptr, attrs, page_size, fi);
+        }
         return 0;
     }
 
     if (regime_using_lpae_format(env, mmu_idx)) {
-        return get_phys_addr_lpae(env, address, access_type, mmu_idx, false,
+        ret = get_phys_addr_lpae(env, address, access_type, mmu_idx, false,
                                   phys_ptr, attrs, prot, page_size,
                                   fi, cacheattrs);
+        if (ret) {
+            return ret;
+        }
+        if (cpu_isar_feature(aa64_rme, env_archcpu(env)) &&
+            !arm_mmu_idx_is_stage1_of_2(mmu_idx)) {
+            /* one-stage regime translation done, check granule protection. */
+            if (rme_regime_is_root(env, mmu_idx) &&
+                (access_type == MMU_INST_FETCH) &&
+                (rme_attrs_to_security_state(attrs) != ARMSecurityState_Root)) {
+                /* During execution at EL3, any attempt to execute an instruction fetched from
+                *  physical memory other than root pas causes a Permission fault.
+                */
+                fi->type = ARMFault_Permission;
+                fi->level = 0;
+                fi->stage2 = false;
+                return true;
+            }
+            if (rme_regime_is_realm(env, mmu_idx) &&
+                (access_type == MMU_INST_FETCH) &&
+                (rme_attrs_to_security_state(attrs) != ARMSecurityState_Realm)) {
+                /* If execution is using the realm EL2 or EL2&0 translation regime, any
+                *  attempt to execute an instruction fetched from physical memory other than
+                *  realm pas cause a stage1 Permission fault.
+                */
+                fi->type = ARMFault_Permission;
+                fi->level = 0;
+                fi->stage2 = false;
+                return true;
+            }
+            return rme_check_granule_protection(env, *phys_ptr, attrs, page_size, fi);
+        }
+        return 0;
     } else if (regime_sctlr(env, mmu_idx) & SCTLR_XP) {
         return get_phys_addr_v6(env, address, access_type, mmu_idx,
                                 phys_ptr, attrs, prot, page_size, fi);

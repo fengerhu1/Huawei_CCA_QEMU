@@ -938,6 +938,16 @@ void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                                               idxmap, bits);
 }
 
+void tlb_flush_range_by_pa(CPUState *cpu, target_ulong paddr, target_ulong len)
+{
+    tlb_flush(cpu);
+}
+
+void tlb_flush_range_by_pa_all_cpus_synced(CPUState *cpu, target_ulong paddr, target_ulong len)
+{
+    tlb_flush_all_cpus_synced(cpu);
+}
+
 /* update the TLBs so that writes to code in the virtual page 'addr'
    can be detected */
 void tlb_protect_code(ram_addr_t ram_addr)
@@ -1086,6 +1096,17 @@ static void tlb_add_large_page(CPUArchState *env, int mmu_idx,
     env_tlb(env)->d[mmu_idx].large_page_mask = lp_mask;
 }
 
+static int tlb_state(CPUState *cpu, int mmu_idx)
+{
+    CPUClass *cc = CPU_GET_CLASS(cpu);
+
+    if (cc->tcg_ops->tlb_state) {
+        return cc->tcg_ops->tlb_state(cpu, mmu_idx);
+    }
+
+    return 0;
+}
+
 /* Add a new TLB entry. At most one entry for a given virtual address
  * is permitted. Only a single TARGET_PAGE_SIZE region is mapped, the
  * supplied size is only used by tlb_flush_page.
@@ -1111,6 +1132,7 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
     int asidx = cpu_asidx_from_attrs(cpu, attrs);
     int wp_flags;
     bool is_ram, is_romd;
+    int nse_state;
 
     assert_cpu_is_self(cpu);
 
@@ -1230,6 +1252,8 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
     desc->iotlb[index].addr = iotlb - vaddr_page;
     desc->iotlb[index].attrs = attrs;
 
+    nse_state = tlb_state(env_cpu(env), mmu_idx);
+
     /* Now calculate the new entry */
     tn.addend = addend - vaddr_page;
     if (prot & PAGE_READ) {
@@ -1237,12 +1261,14 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
         if (wp_flags & BP_MEM_READ) {
             tn.addr_read |= TLB_WATCHPOINT;
         }
+        tn.addr_read |= nse_state;
     } else {
         tn.addr_read = -1;
     }
 
     if (prot & PAGE_EXEC) {
         tn.addr_code = address;
+        tn.addr_code |= nse_state;
     } else {
         tn.addr_code = -1;
     }
@@ -1256,6 +1282,7 @@ void tlb_set_page_with_attrs(CPUState *cpu, target_ulong vaddr,
         if (wp_flags & BP_MEM_WRITE) {
             tn.addr_write |= TLB_WATCHPOINT;
         }
+        tn.addr_write |= nse_state;
     }
 
     copy_tlb_helper_locked(te, &tn);
@@ -1931,6 +1958,19 @@ load_helper(CPUArchState *env, target_ulong addr, MemOpIdx oi,
         tlb_addr &= ~TLB_INVALID_MASK;
     }
 
+    if (tlb_state(env_cpu(env), mmu_idx) != (tlb_addr & TLB_STATE_NSE)) {
+        qemu_spin_lock(&env_tlb(env)->c.lock);
+        tlb_flush_page_locked(env, mmu_idx, tlb_addr & TARGET_PAGE_MASK);
+        qemu_spin_unlock(&env_tlb(env)->c.lock);
+        /* whether we need to flush jmp cache like tlb_flush_page_by_mmuidx_async_0 or not?*/
+
+        tlb_fill(env_cpu(env), addr, size, access_type, mmu_idx, retaddr);
+        index = tlb_index(env, mmu_idx, addr);
+        entry = tlb_entry(env, mmu_idx, addr);
+        tlb_addr = code_read ? entry->addr_code : entry->addr_read;
+        tlb_addr &= ~TLB_INVALID_MASK;
+    }
+
     /* Handle anything that isn't just a straight memory access.  */
     if (unlikely(tlb_addr & ~TARGET_PAGE_MASK)) {
         CPUIOTLBEntry *iotlbentry;
@@ -2326,6 +2366,17 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
             index = tlb_index(env, mmu_idx, addr);
             entry = tlb_entry(env, mmu_idx, addr);
         }
+        tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
+    }
+
+    if (tlb_state(env_cpu(env), mmu_idx) != (tlb_addr & TLB_STATE_NSE)) {
+        qemu_spin_lock(&env_tlb(env)->c.lock);
+        tlb_flush_page_locked(env, mmu_idx, tlb_addr & TARGET_PAGE_MASK);
+        qemu_spin_unlock(&env_tlb(env)->c.lock);
+
+        tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE, mmu_idx, retaddr);
+        index = tlb_index(env, mmu_idx, addr);
+        entry = tlb_entry(env, mmu_idx, addr);
         tlb_addr = tlb_addr_write(entry) & ~TLB_INVALID_MASK;
     }
 

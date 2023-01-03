@@ -396,10 +396,17 @@ CPUArchState *cpu_copy(CPUArchState *env);
 #define TLB_BSWAP           (1 << (TARGET_PAGE_BITS_MIN - 5))
 /* Set if TLB entry writes ignored.  */
 #define TLB_DISCARD_WRITE   (1 << (TARGET_PAGE_BITS_MIN - 6))
+/* Set if TLB entry state is NSE(Armv9 FEAT_RME) */
+#define TLB_STATE_NSE     (1 << (TARGET_PAGE_BITS_MIN - 7))
 
 /* Use this mask to check interception with an alignment mask
  * in a TCG backend.
  */
+/*
+#define TLB_FLAGS_MASK \
+    (TLB_INVALID_MASK | TLB_NOTDIRTY | TLB_MMIO \
+    | TLB_WATCHPOINT | TLB_BSWAP | TLB_DISCARD_WRITE | TLB_STATE_NSE)
+*/
 #define TLB_FLAGS_MASK \
     (TLB_INVALID_MASK | TLB_NOTDIRTY | TLB_MMIO \
     | TLB_WATCHPOINT | TLB_BSWAP | TLB_DISCARD_WRITE)
