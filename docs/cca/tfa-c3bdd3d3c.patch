@@ -1117,7 +1117,7 @@ new file mode 100644
 index 000000000..0f6465cff
 --- /dev/null
 +++ b/plat/qemu/common/qemu_realm_attest_key.c
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,27 @@
 +/*
 + * Copyright (c) 2022, ARM Limited and Contributors. All rights reserved.
 + *
@@ -1145,7 +1145,6 @@ index 000000000..0f6465cff
 +
 +        return 0;
 +}
-+
 diff --git a/plat/qemu/common/trp/qemu_trp.mk b/plat/qemu/common/trp/qemu_trp.mk
 new file mode 100644
 index 000000000..35e2c50da
