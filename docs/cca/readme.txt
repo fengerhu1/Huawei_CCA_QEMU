@@ -7,25 +7,10 @@ environment.
 Prepare the environment
 -----------------------
 
-Prepare the source code:
-
-tf-a-tests and trusted-firmware-a need to be patched with our CCA
-implementation.
-
-git clone https://git.trustedfirmware.org/TF-A/tf-a-tests.git
-cd tf-a-tests
-git checkout 911fa6ba3
-git apply path/to/tftf-911fa6ba3.patch
-
-git clone https://git.trustedfirmware.org/TF-A/trusted-firmware-a.git
-cd trusted-firmware-a
-git checkout c3bdd3d3c
-git apply path/to/tfa-c3bdd3d3c.patch
-
 The current directory contains three subdirectories:
  * qemu (this repo)
- * tf-a-tests
- * trusted-firmware-a
+ * tf-a-tests (https://github.com/Huawei/Huawei_CCA_TFTF.git)
+ * trusted-firmware-a (https://github.com/Huawei/Huawei_CCA_TFA.git)
 
 Prepare the compiler:
 export CROSS_COMPILE=aarch64-none-elf-
