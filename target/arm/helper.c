@@ -4827,9 +4827,10 @@ static void tlbi_aa64_vae2is_write(CPUARMState *env, const ARMCPRegInfo *ri,
     CPUState *cs = env_cpu(env);
     uint64_t pageaddr = sextract64(value << 12, 0, 56);
     int bits = tlbbits_for_regime(env, ARMMMUIdx_E2, pageaddr);
+    ARMMMUIdx mmu_idx = arm_hcr_el2_eff(env) & HCR_E2H ?
+        ARMMMUIdxBit_E20_2 : ARMMMUIdxBit_E2;
 
-    tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr,
-                                                  ARMMMUIdxBit_E2, bits);
+    tlb_flush_page_bits_by_mmuidx_all_cpus_synced(cs, pageaddr, mmu_idx, bits);
 }
 
 static void tlbi_aa64_vae3is_write(CPUARMState *env, const ARMCPRegInfo *ri,
