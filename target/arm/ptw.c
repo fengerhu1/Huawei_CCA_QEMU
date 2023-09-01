@@ -14,6 +14,9 @@
 #include "cpu.h"
 #include "internals.h"
 #include "idau.h"
+#include "qemu/qemu-print.h"
+
+#define BREAK_POINT 0xf011648
 
 
 typedef struct S1Translate {
@@ -1264,6 +1267,119 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
     return prot_rw | PAGE_EXEC;
 }
 
+/*
+ * Translate section/page access permissions to protection flags
+ * @env:     CPUARMState
+ * @mmu_idx: MMU index indicating required translation regime
+ * @is_aa64: TRUE if AArch64
+ * @ap:      The 2-bit simple AP (AP[2:1])
+ * @xn:      XN (execute-never) bit
+ * @pxn:     PXN (privileged execute-never) bit
+ * @in_pa:   The original input pa space
+ * @out_pa:  The output pa space, modified by NSTable, NS, and NSE
+ */
+static int my_get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
+                      int ap, int xn, int pxn,
+                      ARMSecuritySpace in_pa, ARMSecuritySpace out_pa)
+{
+    bool is_user = regime_is_user(env, mmu_idx);
+    int prot_rw, user_rw;
+    bool have_wxn;
+    int wxn = 0;
+
+    assert(!regime_is_stage2(mmu_idx));
+
+    user_rw = simple_ap_to_rw_prot_is_user(ap, true);
+    if (is_user) {
+        prot_rw = user_rw;
+    } else {
+        if (user_rw && regime_is_pan(env, mmu_idx)) {
+            /* PAN forbids data accesses but doesn't affect insn fetch */
+            prot_rw = 0;
+        } else {
+            prot_rw = simple_ap_to_rw_prot_is_user(ap, false);
+        }
+    }
+
+    if (in_pa != out_pa) {
+        switch (in_pa) {
+        case ARMSS_Root:
+            /*
+             * R_ZWRVD: permission fault for insn fetched from non-Root,
+             * I_WWBFB: SIF has no effect in EL3.
+             */
+            return prot_rw;
+        case ARMSS_Realm:
+            /*
+             * R_PKTDS: permission fault for insn fetched from non-Realm,
+             * for Realm EL2 or EL2&0.  The corresponding fault for EL1&0
+             * happens during any stage2 translation.
+             */
+            switch (mmu_idx) {
+            case ARMMMUIdx_E2:
+            case ARMMMUIdx_E20_0:
+            case ARMMMUIdx_E20_2:
+            case ARMMMUIdx_E20_2_PAN:
+                printf("[QEMU]: read only\n");
+                return prot_rw;
+            default:
+                break;
+            }
+            break;
+        case ARMSS_Secure:
+            if (env->cp15.scr_el3 & SCR_SIF) {
+                return prot_rw;
+            }
+            break;
+        default:
+            /* Input NonSecure must have output NonSecure. */
+            g_assert_not_reached();
+        }
+    }
+
+    /* TODO have_wxn should be replaced with
+     *   ARM_FEATURE_V8 || (ARM_FEATURE_V7 && ARM_FEATURE_EL2)
+     * when ARM_FEATURE_EL2 starts getting set. For now we assume all LPAE
+     * compatible processors have EL2, which is required for [U]WXN.
+     */
+    have_wxn = arm_feature(env, ARM_FEATURE_LPAE);
+
+    if (have_wxn) {
+        wxn = regime_sctlr(env, mmu_idx) & SCTLR_WXN;
+    }
+
+    if (is_aa64) {
+        if (regime_has_2_ranges(mmu_idx) && !is_user) {
+            xn = pxn || (user_rw & PAGE_WRITE);
+        }
+    } else if (arm_feature(env, ARM_FEATURE_V7)) {
+        switch (regime_el(env, mmu_idx)) {
+        case 1:
+        case 3:
+            if (is_user) {
+                xn = xn || !(user_rw & PAGE_READ);
+            } else {
+                int uwxn = 0;
+                if (have_wxn) {
+                    uwxn = regime_sctlr(env, mmu_idx) & SCTLR_UWXN;
+                }
+                xn = xn || !(prot_rw & PAGE_READ) || pxn ||
+                     (uwxn && (user_rw & PAGE_WRITE));
+            }
+            break;
+        case 2:
+            break;
+        }
+    } else {
+        xn = wxn = 0;
+    }
+
+    if (xn || (wxn && (prot_rw & PAGE_WRITE))) {
+        return prot_rw;
+    }
+    return prot_rw | PAGE_EXEC;
+}
+
 static ARMVAParameters aa32_va_parameters(CPUARMState *env, uint32_t va,
                                           ARMMMUIdx mmu_idx)
 {
@@ -1487,6 +1603,11 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     uint64_t descriptor, new_descriptor;
     ARMSecuritySpace out_space;
 
+    if (address == BREAK_POINT)
+    {
+        printf("[QEMU]: address is address\n");
+    }
+
     /* TODO: This code does not support shareability levels. */
     if (aarch64) {
         int ps;
@@ -1505,6 +1626,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
          * so our choice is to always raise the fault.
          */
         if (param.tsz_oob) {
+            printf("[QEMU] do_translation_fault 1\n");
             goto do_translation_fault;
         }
 
@@ -1547,9 +1669,13 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
      */
     if (inputsize < addrsize) {
         target_ulong top_bits = sextract64(address, inputsize,
-                                           addrsize - inputsize);
+                                           addrsize - inputsize);                        
         if (-top_bits != param.select) {
             /* The gap between the two regions is a Translation fault */
+            ttbr = regime_ttbr(env, mmu_idx, param.select);
+            printf("[QEMU] do_translation_fault 2, top bit %lx -top bit %lx select %x ptw->in_space %x\n", top_bits, -top_bits, param.select, ptw->in_space);
+            printf("[QEMU] do_translation_fault 2, address %lx inputsize %x addrsize %x ttbrn %lx\n", address, inputsize, addrsize, ttbr);
+
             goto do_translation_fault;
         }
     }
@@ -1576,6 +1702,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
          * Translation table walk disabled => Translation fault on TLB miss
          * Note: This is always 0 on 64-bit EL2 and EL3.
          */
+        printf("[QEMU] do_translation_fault 3\n");
         goto do_translation_fault;
     }
 
@@ -1598,6 +1725,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
                                             inputsize, stride);
         if (startlevel == INT_MIN) {
             level = 0;
+            printf("[QEMU] do_translation_fault 4\n");
             goto do_translation_fault;
         }
         level = startlevel;
@@ -1621,6 +1749,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     } else if (descaddr >> outputsize) {
         level = 0;
         fi->type = ARMFault_AddressSize;
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: handle fault 7\n");
+        }
         goto do_fault;
     }
 
@@ -1652,6 +1784,11 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     descaddr |= (address >> (stride * (4 - level))) & indexmask;
     descaddr &= ~7ULL;
 
+    if (address == BREAK_POINT)
+    {
+        printf("[QEMU]: descaddr %lx\n", descaddr);
+    }
+
     /*
      * Process the NSTable bit from the previous level.  This changes
      * the table address space and the output space from Secure to
@@ -1671,10 +1808,18 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     }
 
     if (!S1_ptw_translate(env, ptw, descaddr, fi)) {
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: handle fault 6\n");
+        }
         goto do_fault;
     }
     descriptor = arm_ldq_ptw(env, ptw, fi);
     if (fi->type != ARMFault_None) {
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: handle fault 5\n");
+        }
         goto do_fault;
     }
     new_descriptor = descriptor;
@@ -1682,6 +1827,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
  restart_atomic_update:
     if (!(descriptor & 1) || (!(descriptor & 2) && (level == 3))) {
         /* Invalid, or the Reserved level 3 encoding */
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU] do_translation_fault 5 descriptor %lx\n", descriptor);
+        }
         goto do_translation_fault;
     }
 
@@ -1701,6 +1850,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
         }
     } else if (descaddr >> outputsize) {
         fi->type = ARMFault_AddressSize;
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: handle fault 4\n");
+        }
         goto do_fault;
     }
 
@@ -1743,6 +1896,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
                 new_descriptor |= 1 << 10; /* AF */
             } else {
                 fi->type = ARMFault_AccessFlag;
+                if (address == BREAK_POINT)
+                {
+                    printf("[QEMU]: handle fault 3\n");
+                }
                 goto do_fault;
             }
         }
@@ -1855,12 +2012,27 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
          * Note that we modified ptw->in_space earlier for NSTable, but
          * result->f.attrs retains a copy of the original security space.
          */
+        if (address == BREAK_POINT)
+        {
+            result->f.prot = my_get_S1prot(env, mmu_idx, aarch64, ap, xn, pxn,
+                                    result->f.attrs.space, out_space);
+        } else {
         result->f.prot = get_S1prot(env, mmu_idx, aarch64, ap, xn, pxn,
                                     result->f.attrs.space, out_space);
+        }
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: get_S1prot mmu_idx %d ap %d xn %d pxn %d result->f.attrs.space %d out_space %d\n", 
+                mmu_idx, ap, xn, pxn, result->f.attrs.space, out_space);
+        }
     }
 
     if (!(result->f.prot & (1 << access_type))) {
         fi->type = ARMFault_Permission;
+        if (address == BREAK_POINT)
+        {
+            printf("[QEMU]: handle fault 2 result->f.prot %d access_type %d\n", result->f.prot, access_type);
+        }
         goto do_fault;
     }
 
@@ -1868,6 +2040,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     if (new_descriptor != descriptor) {
         new_descriptor = arm_casq_ptw(env, descriptor, new_descriptor, ptw, fi);
         if (fi->type != ARMFault_None) {
+            if (address == BREAK_POINT)
+            {
+                printf("[QEMU]: handle fault 1\n");
+            }
             goto do_fault;
         }
         /*
@@ -1925,6 +2101,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
     /* Tag the error as S2 for failed S1 PTW at S2 or ordinary S2.  */
     fi->stage2 = fi->s1ptw || regime_is_stage2(mmu_idx);
     fi->s1ns = mmu_idx == ARMMMUIdx_Stage2;
+    if (address == BREAK_POINT)
+    {
+        printf("[QEMU]: handle fault\n");
+    }
     return true;
 }
 
